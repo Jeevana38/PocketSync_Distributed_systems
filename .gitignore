@@ -5,4 +5,5 @@ __pycache__/
 *.db
 demo_data/
 demo_conflicts/
+config/peers.json
 reports/

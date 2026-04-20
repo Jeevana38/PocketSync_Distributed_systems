@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import sys
 import time
 from urllib import request
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = ROOT / "config" / "peers.json"
 
 
 def parse_patch(values: list[str]) -> dict[str, str]:
@@ -16,6 +20,25 @@ def parse_patch(values: list[str]) -> dict[str, str]:
         key, raw = value.split("=", 1)
         patch[key.strip()] = raw.strip()
     return patch
+
+
+def load_config(path: str | Path) -> dict[str, str]:
+    config_path = Path(path)
+    if not config_path.exists():
+        return {}
+    with config_path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+    return {str(key): str(value).rstrip("/") for key, value in data.items()}
+
+
+def resolve_target(target: str, config: dict[str, str]) -> str:
+    if target.startswith("http://") or target.startswith("https://"):
+        return target.rstrip("/")
+    if target in config:
+        return config[target]
+    raise SystemExit(
+        f"Unknown replica {target!r}. Use a full URL or add it to the peer config."
+    )
 
 
 def http_get(base_url: str, path: str) -> object:
@@ -36,27 +59,36 @@ def http_post(base_url: str, path: str, payload: object) -> object:
 
 
 def cmd_update(args: argparse.Namespace) -> None:
-    result = http_post(args.url, "/update", {"record_id": args.record, "patch": parse_patch(args.field)})
+    config = load_config(args.config)
+    url = resolve_target(args.target, config)
+    result = http_post(url, "/update", {"record_id": args.record, "patch": parse_patch(args.field)})
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def cmd_show(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    url = resolve_target(args.target, config)
     path = f"/records/{args.record}" if args.record else "/records"
-    print(json.dumps(http_get(args.url, path), indent=2, sort_keys=True))
+    print(json.dumps(http_get(url, path), indent=2, sort_keys=True))
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
-    print(json.dumps(http_get(args.url, "/summary"), indent=2, sort_keys=True))
+    config = load_config(args.config)
+    url = resolve_target(args.target, config)
+    print(json.dumps(http_get(url, "/summary"), indent=2, sort_keys=True))
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    left_url = resolve_target(args.left, config)
+    right_url = resolve_target(args.right, config)
     last_error: Exception | None = None
     for attempt in range(1, args.retries + 1):
         try:
-            result = sync_once(args.left_url, args.right_url)
+            result = sync_once(left_url, right_url)
             print(
                 "synced "
-                f"{args.left_url}<->{args.right_url}: "
+                f"{args.left}<->{args.right}: "
                 f"left sent {result['left_sent']}, right sent {result['right_sent']}, "
                 f"applied {result['applied']}, "
                 f"transferred about {result['bytes_transferred']} bytes "
@@ -94,26 +126,27 @@ def sync_once(left_url: str, right_url: str) -> dict[str, int]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="PocketSync remote HTTP CLI")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="peer config JSON path")
     sub = parser.add_subparsers(required=True)
 
     update = sub.add_parser("update", help="apply a local update through one replica server")
-    update.add_argument("url", help="replica URL, for example http://192.168.56.101:8001")
+    update.add_argument("target", help="replica name from config or full URL")
     update.add_argument("record")
     update.add_argument("field", nargs="+")
     update.set_defaults(func=cmd_update)
 
     show = sub.add_parser("show", help="show records from one replica server")
-    show.add_argument("url")
+    show.add_argument("target", help="replica name from config or full URL")
     show.add_argument("record", nargs="?")
     show.set_defaults(func=cmd_show)
 
     summary = sub.add_parser("summary", help="show one replica's version summary")
-    summary.add_argument("url")
+    summary.add_argument("target", help="replica name from config or full URL")
     summary.set_defaults(func=cmd_summary)
 
     sync = sub.add_parser("sync", help="run pairwise anti-entropy over HTTP")
-    sync.add_argument("left_url")
-    sync.add_argument("right_url")
+    sync.add_argument("left", help="replica name from config or full URL")
+    sync.add_argument("right", help="replica name from config or full URL")
     sync.add_argument("--retries", type=int, default=1, help="number of sync attempts before giving up")
     sync.add_argument("--retry-delay", type=float, default=2.0, help="seconds to wait between failed attempts")
     sync.set_defaults(func=cmd_sync)

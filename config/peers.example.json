@@ -1,0 +1,5 @@
+{
+  "laptop": "http://<ip1>:8001",
+  "phone": "http://<ip2>:8002",
+  "tablet": "http://<ip3>:8003"
+}
