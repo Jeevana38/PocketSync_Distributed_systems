@@ -1,0 +1,241 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[letterpaper,top=0.75in,bottom=0.9in,left=0.75in,right=0.75in]{geometry}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{times}
+\usepackage{graphicx}
+\usepackage{array}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\newcommand{\update}[1]{\textcolor{blue}{#1}}
+
+\title{\textbf{An Offline-First Personal-Scale Distributed System for\\
+Synchronizing Structured Personal Records}}
+
+\author{
+Jeevana Kalvakuntla\\
+University of Colorado Boulder\\
+USA
+\and
+Divya Sai Sindhuja Vankineni\\
+University of Colorado Boulder\\
+USA
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\update{Managing structured personal data across multiple devices usually depends on a centralized cloud backend. That model is convenient, but it introduces a single administrative domain, limited transparency, and poor behavior when users edit data while offline. This project studies a narrower and more feasible problem than a general-purpose distributed database: an offline-first, personal-scale replicated record store for a single user's structured records, using job-application tracking as the motivating workload. Our system, PocketSync, targets a small number of user-owned devices (for example, laptop, phone, and tablet), assumes intermittent connectivity, and emphasizes simple synchronization, low metadata overhead, and privacy-conscious replication rather than sharding, global transactions, or multi-tenant scale.}
+
+\update{For Project Update 2, we moved from a proposed design to a working prototype. PocketSync now implements SQLite-backed local replicas, append-only mutation logs, compact version summaries, pairwise anti-entropy synchronization, and three deterministic conflict-resolution policies. The current implementation can simulate offline edits across multiple replicas and later synchronize them to test convergence and lost-update behavior.}
+\end{abstract}
+
+\section{Introduction}
+
+\update{People increasingly maintain important personal information across multiple devices, including notes, reminders, spreadsheets, and application trackers. In practice, these records are often edited opportunistically: a user may update a deadline from their phone, add interview notes from a laptop, and revise status fields later while offline. Existing cloud-backed tools hide synchronization behind a central service, but that convenience comes with trade-offs: user data passes through a single provider, offline behavior is often opaque, and concurrent edits may be resolved in ways that are difficult to inspect or control.}
+
+Our original proposal framed this problem broadly as decentralized synchronization for structured personal data. Based on feedback and implementation planning, we narrowed the project to a more precise distributed systems question: for a single user with a small set of trusted devices, what is the simplest replication design that provides reliable offline-first synchronization for structured records without the machinery of a full distributed database?
+
+\update{For Update 2, this scope remains unchanged, but it is now supported by a concrete implementation. We are not trying to build a large-scale storage system with sharding, leader election, geo-replication, secondary indexes, or arbitrary multi-user collaboration. Instead, PocketSync focuses on a constrained but realistic setting with three defining properties: (1) few replicas, roughly 2--5 devices; (2) intermittent disconnection with later reconciliation; and (3) sensitive personal data that should remain under user control.}
+
+These properties create opportunities that large-scale systems do not target directly. Since all replicas belong to one user, the workload is small and trust assumptions are simpler. Since records are structured, conflict resolution can use field semantics rather than blindly overwriting whole objects. Since the data is personal, reducing dependence on a central cloud service and minimizing synchronization metadata are meaningful design goals.
+
+\update{The main contributions at this stage are: (1) an implemented prototype of PocketSync, a personal-scale replicated record store with offline-first synchronization; (2) a working pairwise anti-entropy protocol based on version summaries and mutation logs; (3) three implemented conflict-resolution strategies; and (4) a preliminary evaluation workflow for measuring convergence, lost updates, and synchronization overhead.}
+
+\section{Background and Motivation}
+
+Distributed systems research has long studied how replicas maintain consistent state in the presence of failures, partitions, and concurrency. Dynamo showed that high availability can be achieved through replication and eventual reconciliation rather than strict coordination~\cite{dynamo}. Bayou explored weakly consistent replicated storage specifically for disconnected operation~\cite{bayou}. CRDTs formalized data types whose independently applied updates are guaranteed to converge without coordination~\cite{crdt}. Local-first software has argued for application designs in which user data remains local by default while synchronization is layered on afterward~\cite{localfirst}.
+
+These systems motivate our project, but they also highlight why our setting deserves a narrower design point. Dynamo and similar systems address large-scale service infrastructure; their concerns include partition tolerance at datacenter scale, replica placement, heterogeneous failures, and operational complexity. CRDT frameworks offer strong convergence guarantees, but they often require richer metadata, specialized object semantics, and implementation complexity that may be unnecessary for a small number of structured personal records. Local-first systems are philosophically aligned with our goal, but many available systems target collaborative editors or general-purpose application frameworks rather than simple personal record synchronization.
+
+\update{PocketSync therefore explores the gap between centralized cloud applications and fully general replicated data systems. The goal is not to claim that existing systems are too complex in absolute terms; rather, they solve a broader problem than ours. For a single user's structured records, we can exploit a fixed replica set, a low-throughput workload, and a known schema. This lets us ask a targeted question: how much correctness and usability can we obtain from simple synchronization mechanisms before needing the full generality of CRDTs or a distributed database?}
+
+\section{Project Scope and System Model}
+
+PocketSync is a single-user, multi-device replicated store. Each device holds a full local replica of a collection of structured records. The initial target schema is a job-application tracker, where each record contains fields such as company, role, location, application status, next deadline, last-contacted date, and free-form notes. Attachments and binary files are out of scope for this semester project because they would complicate synchronization substantially without helping answer our main research question.
+
+We assume an asynchronous network with delay, reordering, temporary disconnection, and occasional message loss. Devices may continue to accept local updates while offline. Once communication resumes, replicas should eventually converge to the same state. We do not aim to support strong consistency, global serializability, multi-record transactions, adversarial peers, or Byzantine faults.
+
+\update{In the prototype, each logical device is represented by a separate SQLite-backed replica. For example, the demo uses three replicas named laptop, phone, and tablet, each with its own database file. Offline behavior is modeled by allowing each replica to accept local updates while no synchronization command is run. Reconnection is modeled by running pairwise synchronization between replicas. This allows us to test the core distributed behavior locally before moving to a process-based or VM-based deployment.}
+
+\section{System Design}
+
+\update{Figure~\ref{fig:architecture} summarizes the finalized PocketSync design. Each replica runs the same four logical components: local storage, mutation log and metadata, sync manager, and conflict resolver.}
+
+\begin{figure}[t]
+\centering
+\fbox{
+\begin{minipage}{0.88\columnwidth}
+\centering
+\textbf{Replica A}\\
+Local API/CLI\\
+SQLite Replica\\
+Mutation Log + Metadata\\
+Conflict Resolver + Sync Manager\\[0.5em]
+\rule{0.85\columnwidth}{0.4pt}\\
+\textit{summary / missing mutations / acknowledgments}\\
+\rule{0.85\columnwidth}{0.4pt}\\[0.5em]
+\textbf{Replica B}\\
+Local API/CLI\\
+SQLite Replica\\
+Mutation Log + Metadata\\
+Conflict Resolver + Sync Manager
+\end{minipage}
+}
+\caption{\update{PocketSync architecture. Each device stores a full local replica and exchanges missing mutations with peers through pairwise anti-entropy synchronization.}}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{Local Data Model}
+
+The system stores structured records rather than arbitrary documents. Our initial schema for a job-application record includes a stable record identifier, descriptive fields such as company, role, and location, progress fields such as status, last-contacted date, and next deadline, and user-authored notes. This schema is intentionally narrow because it lets us study whether domain semantics can improve merge quality.
+
+\update{The implementation stores current records in SQLite as JSON values. A separate SQLite table stores the append-only mutation log. This keeps the implementation small and explainable while preserving the key pieces of replicated state needed for synchronization.}
+
+\subsection{Mutation Log and Version Summaries}
+
+\update{Every local edit becomes a mutation. A mutation contains the replica identifier, a per-replica counter, the record identifier, a patch containing changed fields, and a logical timestamp. The per-replica counter functions like a lightweight Lamport-style clock.}
+
+\update{Each replica can summarize its state using a version summary: a map from replica id to the highest mutation counter from that replica that has been observed. For example, a summary such as \texttt{\{laptop: 2, phone: 1\}} means the replica has seen the first two laptop mutations and the first phone mutation. This compact summary allows a peer to determine which mutations are missing without sending the entire database.}
+
+\subsection{Pairwise Anti-Entropy Protocol}
+
+Synchronization is implemented as periodic pairwise anti-entropy. A node first sends a summary of what it has seen. Its peer compares that summary against local metadata and returns only updates that are missing or concurrent. The receiver then applies these updates through the conflict-resolution module and advances its summary.
+
+\update{The implemented protocol is:}
+
+\begin{enumerate}[leftmargin=*]
+    \item \update{Replica A sends its version summary to Replica B.}
+    \item \update{Replica B sends its version summary to Replica A.}
+    \item \update{Each replica scans its mutation log and identifies mutations not dominated by the peer's summary.}
+    \item \update{Each replica sends only those missing mutations.}
+    \item \update{The receiver stores unseen mutations and applies them using the selected conflict policy.}
+\end{enumerate}
+
+The protocol deliberately avoids leader-based coordination. Because our goal is offline-first behavior, any replica may accept local writes at any time. Synchronization only occurs when a peer becomes reachable. Eventual convergence therefore depends on update propagation plus deterministic merge rules, not on a central authority.
+
+\subsection{Conflict-Resolution Strategies}
+
+The key idea of the project is that personal structured records may benefit from lightweight schema-aware conflict handling. We implement and compare three strategies.
+
+\textbf{Record-level LWW.} Concurrent writes to a record are resolved by keeping the version with the latest logical timestamp. This is the simplest baseline, but it can discard unrelated field updates.
+
+\textbf{Field-wise LWW.} Each field carries its own timestamp so concurrent updates to different fields can be preserved. This increases metadata modestly while remaining simple.
+
+\textbf{Schema-aware merge.} Fields follow record-specific rules. Free-form notes are merged append-only with deterministic ordering. Descriptive fields such as company, role, and location are treated as mostly immutable after creation. Status follows a monotonic workflow order, so a stale status update should not overwrite a more advanced one. Date fields keep the later date.
+
+\update{The schema-aware policy is what makes the system more than a generic replicated key-value store. It explicitly uses the semantics of job-application records to preserve more user intent than record-level LWW while avoiding the full complexity of a CRDT framework.}
+
+\section{Implementation Progress}
+
+\update{The current prototype is implemented in Python using standard-library dependencies. SQLite is used for local persistence, and records/mutations are stored as JSON-encoded values inside the local replica database. The implementation is intentionally compact so the code can be explained clearly during the project demo.}
+
+\update{The implementation is organized around the following logical modules rather than a single monolithic script:}
+
+\begin{itemize}[leftmargin=*]
+    \item \update{\textbf{Data model and metadata}: represents mutations, replica identifiers, logical counters, record ids, and version summaries.}
+    \item \update{\textbf{Local replica storage}: maintains the current record state and an append-only mutation log in SQLite.}
+    \item \update{\textbf{Synchronization layer}: implements pairwise anti-entropy by comparing version summaries and exchanging missing mutations.}
+    \item \update{\textbf{Conflict-resolution layer}: applies record-level LWW, field-wise LWW, and schema-aware merge policies.}
+    \item \update{\textbf{Evaluation harness}: runs a deterministic three-replica offline-edit workload and reports convergence, preserved updates, and synchronization overhead.}
+    \item \update{\textbf{Manual demo interface}: provides a small command-line interface to create offline edits, inspect individual replicas, and trigger synchronization.}
+\end{itemize}
+
+\update{At this stage, the core synchronization path works end to end. A replica can create a job-application record, other replicas can receive it, each replica can make independent offline edits, and later anti-entropy rounds can propagate and merge the updates.}
+
+\section{Preliminary Results Plan}
+
+\update{The Project Update 2 guideline asks us to clearly state where the implementation stands and include preliminary or partial results if available. We therefore measure the behavior most relevant to an offline-first synchronization system rather than web-application metrics such as average response time or request throughput.}
+
+\update{The primary metrics are:}
+
+\begin{itemize}[leftmargin=*]
+    \item \update{\textbf{Convergence}: whether all replicas reach the same final state after synchronization.}
+    \item \update{\textbf{Preserved updates}: how many independent offline edits survive conflict resolution.}
+    \item \update{\textbf{Synchronization rounds}: how many pairwise sync operations are needed.}
+    \item \update{\textbf{Mutations transferred}: how many missing updates are exchanged during synchronization.}
+    \item \update{\textbf{Note lines preserved}: how many independent note edits survive in the job-application workload.}
+\end{itemize}
+
+\update{Table~\ref{tab:results} shows the output from the current deterministic Update 2 experiment. The workload creates three replicas, synchronizes an initial job record, then simulates an offline period where each replica independently edits a different part of the same record. After the simulated partition, replicas run pairwise anti-entropy synchronization. The experiment is deterministic so that the same workload can be repeated and explained clearly, but the values are generated by the implementation rather than manually assigned in the report.}
+
+\begin{table}[t]
+\centering
+\small
+\update{
+\begin{tabular}{@{}p{0.25\columnwidth}cccccc@{}}
+\toprule
+Policy & Conv. & Rds. & Mut. & Bytes & Fields & Notes \\
+\midrule
+Record LWW & Yes & 3 & 6 & 1084 & 1/3 & 1 \\
+Field LWW & Yes & 3 & 6 & 1084 & 3/3 & 1 \\
+Schema-aware & Yes & 3 & 6 & 1084 & 3/3 & 4 \\
+\bottomrule
+\end{tabular}
+}
+\caption{\update{Preliminary results from the deterministic three-replica offline-edit workload. Conv. means convergence, Rds. means synchronization rounds, Mut. means mutations transferred, Bytes means approximate serialized mutation bytes, Fields means preserved structured fields, and Notes means note lines preserved.}}
+\label{tab:results}
+\end{table}
+
+\update{All three policies converged after synchronization, which means the replicas eventually reached a common state. However, the quality of the final merged state differs by policy. Record-level LWW preserved only one of the three expected structured offline edits because the newest whole-record version can overwrite unrelated changes. Field-wise LWW preserved all three structured field edits, but it still kept only one note line because notes are treated as a single field. Schema-aware merge preserved all three structured field edits and four note lines, showing that job-record-specific merge rules preserve more user intent for this workload without increasing the number of mutations transferred in this experiment.}
+
+\update{We generated these values using an automated evaluation harness that runs the deterministic three-replica workload and records convergence, synchronization overhead, and preserved updates. We also implemented a small command-line demo interface that allows us to manually create offline edits, inspect individual replicas, and trigger synchronization. The automated harness is used for reproducible metrics, while the manual interface is useful for demonstrating how replicas diverge during offline operation and converge after synchronization.}
+
+\section{How We Test the Prototype}
+
+\update{The prototype can be tested locally without physically disconnecting Wi-Fi. Offline behavior is represented by not running synchronization while each replica performs local writes. This models the distributed systems condition we care about: messages are not exchanged during the partition. When the partition heals, we run pairwise sync commands.}
+
+\update{For the manual demo, each logical device is a separate SQLite database. The user can open three terminals and treat them as laptop, phone, and tablet. Before synchronization, each terminal can show a different local state. After synchronization, all three should show the same merged record. This is similar in spirit to running multiple VMs, but lighter-weight for Update 2.}
+
+\update{For the final report, we can extend the same setup to separate processes or VMs if needed. The current Update 2 implementation already tests the core protocol behavior: local writes, disconnected operation, missing-update exchange, deterministic conflict resolution, and eventual convergence.}
+
+\section{Work Attribution}
+
+Jeevana Kalvakuntla led the replication protocol design, metadata format, conflict-resolution policies, and the first working prototype structure. \update{For Update 2, Jeevana also implemented the main synchronization path, drafted the revised system-design text, and prepared the preliminary evaluation workflow.}
+
+Divya Sai Sindhuja Vankineni focused on local storage design, peer communication structure, and the testing/evaluation direction. \update{For the next milestone, Divya will help extend the experiment harness, add more workloads, and refine the measurement scripts.}
+
+Both team members will collaborate on debugging, evaluation, result analysis, and final report writing.
+
+\section{Conclusion}
+
+\update{Project Update 2 moves PocketSync from a design proposal to a working prototype. The implementation demonstrates the main distributed systems ideas from the proposal and Update 1: local-first operation, full replication, mutation logs, compact version summaries, anti-entropy synchronization, deterministic conflict resolution, and eventual convergence. The remaining work is to run the final preliminary metrics for Update 2, expand the workload for the final report, and evaluate the trade-off between simple LWW policies and schema-aware merging.}
+
+\begin{thebibliography}{9}
+
+\bibitem{dynamo}
+Giuseppe DeCandia et al. 2007.
+\textit{Dynamo: Amazon's Highly Available Key-value Store}.
+In Proceedings of SOSP.
+
+\bibitem{crdt}
+Marc Shapiro, Nuno Preguiça, Carlos Baquero, and Marek Zawirski. 2011.
+\textit{Conflict-Free Replicated Data Types}.
+In Proceedings of SSS.
+
+\bibitem{bayou}
+Karin Petersen, Mike Spreitzer, Douglas Terry, Marvin Theimer, and Alan Demers. 1997.
+\textit{Flexible Update Propagation for Weakly Consistent Replication}.
+In Proceedings of SOSP.
+
+\bibitem{localfirst}
+Martin Kleppmann, Adam Wiggins, Peter van Hardenberg, and Mark McGranaghan. 2019.
+\textit{Local-first Software: You Own Your Data, in Spite of the Cloud}.
+In Proceedings of Onward! 2019.
+
+\end{thebibliography}
+
+\end{document}

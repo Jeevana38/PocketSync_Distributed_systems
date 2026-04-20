@@ -1,0 +1,9 @@
+[project]
+name = "pocketsync"
+version = "0.1.0"
+description = "Offline-first personal-scale replicated record store for a distributed systems course project."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
